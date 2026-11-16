@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Голосовой человечек</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0f0f1a;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 100vh;
+    font-family: 'Segoe UI', sans-serif;
+    color: #e0e0e8;
+    overflow: hidden;
+  }
+  #stage {
+    background: radial-gradient(circle at 50% 40%, #1e1e2e, #0a0a12);
+    border-radius: 24px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    cursor: pointer;
+  }
+  .controls {
+    margin-top: 20px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  button {
+    background: #e94560;
+    color: #fff;
+    border: none;
+    padding: 12px 28px;
+    border-radius: 30px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s, filter 0.15s;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:active { transform: scale(0.95); }
+  button.listening {
+    background: #00d9ff;
+    color: #0a0a12;
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(0,217,255,0.5); }
+    50% { box-shadow: 0 0 0 16px rgba(0,217,255,0); }
+  }
+  #status {
+    color: #8892b0;
+    font-size: 14px;
+    min-height: 20px;
+  }
+  .hint {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #555;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="stage" width="500" height="500"></canvas>
+
+<div class="controls">
+  <button id="micBtn">🎤 Включить микрофон</button>
+</div>
+<div id="status">Скажите: «прыгай», «маши», «танцуй» или «стоп»</div>
+<div class="hint">Работает в Chrome / Edge. Нажмите на человечка, чтобы он помахал.</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//   ГОЛОСОВОЙ ЧЕЛОВЕЧЕК
+//   Canvas 2D + Web Speech API
+// ═══════════════════════════════════════════════════════════════
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+const cx = W / 2;
+const groundY = H - 90; // линия «пола»
+
+// ── Состояние персонажа ──
+let state = {
+  // Положение тела (смещение)
+  bodyY: 0,
+  // Углы конечностей (в радианах)
+  leftArm: 0.3,      // плечо → локоть
+  rightArm: 0.3,
+  leftElbow: 0,      // локоть → кисть
+  rightElbow: 0,
+  leftLeg: 0.15,     // бедро → колено
+  rightLeg: 0.15,
+  leftKnee: 0,
+  rightKnee: 0,
+  // Голова
+  headTilt: 0,
+  // Глаза-звёздочки: масштаб
+  eyeScale: 1,
+  // Время
+  t: 0,
+};
+
+// ── Параметры фигуры ──
+const HEAD_R = 28;
+const NECK_Y = -40;      // относительно центра тела
+const SHOULDER_Y = -20;
+const HIP_Y = 30;
+const ARM_LEN = 42;
+const LEG_LEN = 48;
+const FOREARM = 34;
+const SHIN = 38;
+
+// ── Анимационные цели (куда стремимся) ──
+let target = { ...state };
+let currentAction = 'idle'; // idle | wave | dance | jump | stop
+let jumpVelocity = 0;
+let isGrounded = true;
+
+// ── Голос ──
+let recognition = null;
+let listening = false;
+
+// ═══════════════════════════════════════════════════════════════
+//   ОТРИСОВКА
+// ═══════════════════════════════════════════════════════════════
+
+function drawStar(cx, cy, outerR, innerR, points, rot = 0) {
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const r = i % 2 === 0 ? outerR : innerR;
+    const angle = (i * Math.PI) / points + rot - Math.PI / 2;
+    const x = cx + Math.cos(angle) * r;
+    const y = cy + Math.sin(angle) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Фон — лёгкое свечение под персонажем
+  const glow = ctx.createRadialGradient(cx, groundY, 10, cx, groundY, 160);
+  glow.addColorStop(0, 'rgba(0,217,255,0.08)');
+  glow.addColorStop(1, 'transparent');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, H);
+
+  // Пол
+  ctx.beginPath();
+  ctx.moveTo(cx - 120, groundY);
+  ctx.lineTo(cx + 120, groundY);
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // ── Вычисляем позиции ──
+  const bodyCenterY = groundY - 130 + state.bodyY; // центр туловища
+
+  const neck = { x: cx, y: bodyCenterY + NECK_Y };
+  const shoulderL = { x: cx - 16, y: bodyCenterY + SHOULDER_Y };
+  const shoulderR = { x: cx + 16, y: bodyCenterY + SHOULDER_Y };
+  const hipL = { x: cx - 12, y: bodyCenterY + HIP_Y };
+  const hipR = { x: cx + 12, y: bodyCenterY + HIP_Y };
+
+  // ── Руки ──
+  // Левая рука (от плеча)
+  const elbowL = {
+    x: shoulderL.x - Math.sin(state.leftArm) * ARM_LEN,
+    y: shoulderL.y + Math.cos(state.leftArm) * ARM_LEN
+  };
+  const handL = {
+    x: elbowL.x - Math.sin(state.leftArm + state.leftElbow) * FOREARM,
+    y: elbowL.y + Math.cos(state.leftArm + state.leftElbow) * FOREARM
+  };
+
+  // Правая рука
+  const elbowR = {
+    x: shoulderR.x + Math.sin(state.rightArm) * ARM_LEN,
+    y: shoulderR.y + Math.cos(state.rightArm) * ARM_LEN
+  };
+  const handR = {
+    x: elbowR.x + Math.sin(state.rightArm + state.rightElbow) * FOREARM,
+    y: elbowR.y + Math.cos(state.rightArm + state.rightElbow) * FOREARM
+  };
+
+  // ── Ноги ──
+  const kneeL = {
+    x: hipL.x - Math.sin(state.leftLeg) * LEG_LEN,
+    y: hipL.y + Math.cos(state.leftLeg) * LEG_LEN
+  };
+  const footL = {
+    x: kneeL.x - Math.sin(state.leftLeg + state.leftKnee) * SHIN,
+    y: kneeL.y + Math.cos(state.leftLeg + state.leftKnee) * SHIN
+  };
+
+  const kneeR = {
+    x: hipR.x + Math.sin(state.rightLeg) * LEG_LEN,
+    y: hipR.y + Math.cos(state.rightLeg) * LEG_LEN
+  };
+  const footR = {
+    x: kneeR.x + Math.sin(state.rightLeg + state.rightKnee) * SHIN,
+    y: kneeR.y + Math.cos(state.rightLeg + state.rightKnee) * SHIN
+  };
+
+  // ═══ РИСУЕМ ЧЕЛОВЕЧКА ═══
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = '#e0e0e8';
+  ctx.fillStyle = '#e0e0e8';
+
+  // Ноги
+  ctx.beginPath();
+  ctx.moveTo(hipL.x, hipL.y);
+  ctx.lineTo(kneeL.x, kneeL.y);
+  ctx.lineTo(footL.x, footL.y);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(hipR.x, hipR.y);
+  ctx.lineTo(kneeR.x, kneeR.y);
+  ctx.lineTo(footR.x, footR.y);
+  ctx.stroke();
+
+  // Туловище
+  ctx.beginPath();
+  ctx.moveTo(cx, bodyCenterY - 20);
+  ctx.lineTo(cx, bodyCenterY + 30);
+  ctx.stroke();
+
+  // Руки
+  ctx.beginPath();
+  ctx.moveTo(shoulderL.x, shoulderL.y);
+  ctx.lineTo(elbowL.x, elbowL.y);
+  ctx.lineTo(handL.x, handL.y);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(shoulderR.x, shoulderR.y);
+  ctx.lineTo(elbowR.x, elbowR.y);
+  ctx.lineTo(handR.x, handR.y);
+  ctx.stroke();
+
+  // ── Голова (кружок) ──
+  const headX = cx + Math.sin(state.headTilt) * 10;
+  const headY = bodyCenterY + NECK_Y - HEAD_R - 6;
+
+  ctx.beginPath();
+  ctx.arc(headX, headY, HEAD_R, 0, Math.PI * 2);
+  ctx.fillStyle = '#1c1c28';
+  ctx.fill();
+  ctx.strokeStyle = '#00d9ff';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // ── Глазки-звёздочки ──
+  const eyeOffX = 10;
+  const eyeOffY = -4;
+  const starSize = 7 * state.eyeScale;
+
+  // Левый глаз
+  ctx.fillStyle = '#ffd166';
+  ctx.shadowColor = '#ffd166';
+  ctx.shadowBlur = 8;
+  drawStar(headX - eyeOffX, headY + eyeOffY, starSize, starSize * 0.45, 5, state.t);
+  ctx.fill();
+
+  // Правый глаз
+  drawStar(headX + eyeOffX, headY + eyeOffY, starSize, starSize * 0.45, 5, -state.t);
+  ctx.fill();
+
+  ctx.shadowBlur = 0;
+
+  // Улыбка
+  ctx.beginPath();
+  ctx.arc(headX, headY + 6, 8, 0.15, Math.PI - 0.15);
+  ctx.strokeStyle = '#e94560';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//   АНИМАЦИОННЫЙ ЦИКЛ
+// ═══════════════════════════════════════════════════════════════
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function updateAnimation(dt) {
+  state.t += dt;
+
+  // Плавно приближаем текущее состояние к цели
+  const speed = 8;
+  const factor = 1 - Math.exp(-speed * dt);
+
+  for (const key of Object.keys(state)) {
+    if (key === 't' || key === 'bodyY') continue;
+    state[key] = lerp(state[key], target[key], factor);
+  }
+
+  // ── Прыжок (физика) ──
+  if (!isGrounded || state.bodyY < -1) {
+    jumpVelocity += 900 * dt; // гравитация
+    state.bodyY += jumpVelocity * dt;
+    if (state.bodyY >= 0) {
+      state.bodyY = 0;
+      jumpVelocity = 0;
+      isGrounded = true;
+    }
+  }
+
+  // ── Логика действий ──
+  switch (currentAction) {
+    case 'idle': {
+      // Лёгкое дыхание
+      target.leftArm = 0.3 + Math.sin(state.t * 2) * 0.05;
+      target.rightArm = 0.3 + Math.sin(state.t * 2 + 1) * 0.05;
+      target.leftElbow = 0.1;
+      target.rightElbow = 0.1;
+      target.leftLeg = 0.15;
+      target.rightLeg = 0.15;
+      target.leftKnee = 0;
+      target.rightKnee = 0;
+      target.headTilt = Math.sin(state.t * 0.7) * 0.08;
+      target.eyeScale = 1;
+      break;
+    }
+    case 'wave': {
+      // Машем правой рукой
+      target.rightArm = 1.6 + Math.sin(state.t * 12) * 0.5;
+      target.rightElbow = -0.6 + Math.sin(state.t * 12) * 0.4;
+      target.leftArm = 0.3;
+      target.leftElbow = 0.1;
+      target.headTilt = 0.1;
+      target.eyeScale = 1.2;
+      target.leftLeg = 0.15;
+      target.rightLeg = 0.15;
+      break;
+    }
+    case 'dance': {
+      // Танцуем — руки и ноги в ритме
+      target.rightArm = 1.2 + Math.sin(state.t * 8) * 0.8;
+      target.leftArm = 1.2 + Math.sin(state.t * 8 + Math.PI) * 0.8;
+      target.rightElbow = -0.3 + Math.sin(state.t * 8) * 0.5;
+      target.leftElbow = -0.3 + Math.sin(state.t * 8 + Math.PI) * 0.5;
+      target.rightLeg = 0.3 + Math.sin(state.t * 8) * 0.3;
+      target.leftLeg = 0.3 + Math.sin(state.t * 8 + Math.PI) * 0.3;
+      target.rightKnee = Math.max(0, Math.sin(state.t * 8) * 0.5);
+      target.leftKnee = Math.max(0, Math.sin(state.t * 8 + Math.PI) * 0.5);
+      target.headTilt = Math.sin(state.t * 4) * 0.15;
+      target.eyeScale = 1.3;
+      break;
+    }
+    case 'stop': {
+      // Стоим смирно
+      target.rightArm = 0.1;
+      target.leftArm = 0.1;
+      target.rightElbow = 0;
+      target.leftElbow = 0;
+      target.rightLeg = 0.1;
+      target.leftLeg = 0.1;
+      target.rightKnee = 0;
+      target.leftKnee = 0;
+      target.headTilt = 0;
+      target.eyeScale = 0.8;
+      break;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//   ИГРОВОЙ ЦИКЛ
+// ═══════════════════════════════════════════════════════════════
+
+let lastTime = performance.now();
+
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  updateAnimation(dt);
+  draw();
+
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+// ═══════════════════════════════════════════════════════════════
+//   ГОЛОСОВОЕ УПРАВЛЕНИЕ
+// ═══════════════════════════════════════════════════════════════
+
+function initSpeech() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    document.getElementById('status').textContent = '❌ Ваш браузер не поддерживает распознавание речи. Используйте Chrome или Edge.';
+    return null;
+  }
+
+  const rec = new SpeechRecognition();
+  rec.lang = 'ru-RU';
+  rec.continuous = true;      // Слушаем постоянно
+  rec.interimResults = false; // Только финальные результаты
+
+  rec.onresult = (event) => {
+    const last = event.results.length - 1;
+    const text = event.results[last][0].transcript.toLowerCase().trim();
+    document.getElementById('status').textContent = `🎤 Услышал: «${text}»`;
+    handleCommand(text);
+  };
+
+  rec.onerror = (event) => {
+    console.warn('Speech error:', event.error);
+    if (event.error === 'not-allowed') {
+      document.getElementById('status').textContent = '❌ Доступ к микрофону запрещён.';
+      stopListening();
+    }
+  };
+
+  rec.onend = () => {
+    // Если всё ещё должны слушать — перезапускаем
+    if (listening) {
+      try { rec.start(); } catch(e) {}
+    }
+  };
+
+  return rec;
+}
+
+function handleCommand(text) {
+  // Прыжок
+  if (text.includes('прыг') || text.includes('прыгай') || text.includes('прыжок')) {
+    if (isGrounded) {
+      jumpVelocity = -380;
+      isGrounded = false;
+      currentAction = 'jump';
+      // После прыжка возвращаемся в idle
+      setTimeout(() => {
+        if (currentAction === 'jump') currentAction = 'idle';
+      }, 800);
+    }
+    return;
+  }
+
+  // Маши / привет
+  if (text.includes('маши') || text.includes('помаши') || text.includes('привет') || text.includes('рукой')) {
+    currentAction = 'wave';
+    setTimeout(() => {
+      if (currentAction === 'wave') currentAction = 'idle';
+    }, 2500);
+    return;
+  }
+
+  // Танцуй
+  if (text.includes('танц') || text.includes('танцуй') || text.includes('пляши')) {
+    currentAction = 'dance';
+    return;
+  }
+
+  // Стоп / замри
+  if (text.includes('стоп') || text.includes('замри') || text.includes('останов') || text.includes('хватит')) {
+    currentAction = 'stop';
+    setTimeout(() => {
+      if (currentAction === 'stop') currentAction = 'idle';
+    }, 2000);
+    return;
+  }
+
+  // Если ничего не распознали — просто показываем
+}
+
+function startListening() {
+  if (!recognition) {
+    recognition = initSpeech();
+    if (!recognition) return;
+  }
+
+  try {
+    recognition.start();
+    listening = true;
+    const btn = document.getElementById('micBtn');
+    btn.textContent = '🎙 Слушаю...';
+    btn.classList.add('listening');
+    document.getElementById('status').textContent = 'Говорите: «прыгай», «маши», «танцуй», «стоп»';
+  } catch (e) {
+    console.warn('Start error:', e);
+  }
+}
+
+function stopListening() {
+  if (recognition) {
+    listening = false;
+    try { recognition.stop(); } catch(e) {}
+    const btn = document.getElementById('micBtn');
+    btn.textContent = '🎤 Включить микрофон';
+    btn.classList.remove('listening');
+  }
+}
+
+document.getElementById('micBtn').onclick = () => {
+  if (listening) {
+    stopListening();
+    document.getElementById('status').textContent = 'Микрофон выключен.';
+  } else {
+    startListening();
+  }
+};
+
+// ── Клик по человечку — помахать ──
+canvas.addEventListener('click', () => {
+  if (currentAction === 'idle') {
+    currentAction = 'wave';
+    setTimeout(() => {
+      if (currentAction === 'wave') currentAction = 'idle';
+    }, 2000);
+  }
+});
+
+// ── Проверка поддержки ──
+if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+  document.getElementById('status').textContent = '⚠️ Распознавание речи не поддерживается. Откройте в Chrome или Edge.';
+}
+
+</script>
+</body>
+</html>
